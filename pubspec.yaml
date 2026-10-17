@@ -1,0 +1,25 @@
+name: tikal_orm
+description: A type-safe Dart ORM with model-first generation, typed queries, and versioned migrations for PostgreSQL, MySQL/MariaDB and SQLite.
+version: 0.1.0
+repository: https://github.com/Hectorchan10/tikal_orm.git
+
+environment:
+  sdk: ^3.13.5
+
+dependencies:
+  analyzer: ^14.5.0
+  crypto: ^3.0.7
+  meta: ^1.19.0
+  mysql_dart: ^3.0.0
+  path: ^1.9.1
+  postgres: ^3.5.20
+  sqlite3: ^3.0.0
+  synchronized: ^3.5.0
+  uuid: ^4.6.0
+
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.25.6
+
+executables:
+  tikal: tikal
