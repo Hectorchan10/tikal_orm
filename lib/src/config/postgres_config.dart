@@ -67,6 +67,8 @@ enum PostgresSslMode {
 /// Handles credentials in URLs, environment variables and safety checks, and
 /// never prints the password in [toString].
 final class PostgresConfig extends ServerConfig {
+  /// Creates immutable PostgreSQL settings and validates required connection fields.
+  /// Throws TikalConfigurationException for invalid host, port, database or pool settings.
   PostgresConfig({
     super.host = 'localhost',
     super.port = 5432,

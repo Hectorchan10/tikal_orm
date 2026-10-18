@@ -4,25 +4,30 @@ import 'dart:convert';
 import 'guards.dart';
 import 'schema.dart';
 
-// Query
-import '../query/quoting.dart';
+// SQL
+import '../query/sql/quoting.dart';
 
-// Executor
-import '../executor/query_result.dart';
-import '../executor/query_executor.dart';
+// Database
+import '../database/query_result.dart';
+import '../database/query_executor.dart';
 
 export 'guards.dart' show requirePostgresSchema;
 
 /// Reads PostgreSQL catalogs. No DDL, temporary tables or schema writes occur.
 final class SchemaInspector {
+  /// Reads PostgreSQL catalogs through the supplied executor without writing schema.
   const SchemaInspector(this.executor);
+
+  /// Executor used only for read-only PostgreSQL catalog queries.
   final QueryExecutor executor;
 
+  /// Returns the catalog snapshot for supported PostgreSQL tables and constraints.
+  /// Throws TikalUnsupportedException for other engines; driver failures propagate.
   Future<SchemaSnapshot> inspect() async => (await _read()).$1;
 
   /// Compares managed tables only; unrelated tables are outside this snapshot.
   Future<List<String>> check(SchemaSnapshot expected) async {
-    final (actual, incompatible) = await _read();
+    final (actual, incompatible) = await _read(expected: expected);
     final tables = {for (final t in actual.tables) t.key: t};
     final differences = <String>[];
     for (final table in expected.tables) {
@@ -32,6 +37,30 @@ final class SchemaInspector {
         continue;
       }
       differences.addAll(incompatible[table.key] ?? const []);
+      void compareDefinitions(
+        String kind,
+        Map<String, Object?> wanted,
+        Map<String, Object?> actual,
+      ) {
+        for (final name in {...wanted.keys, ...actual.keys}) {
+          if (jsonEncode(wanted[name]) != jsonEncode(actual[name])) {
+            differences.add(
+              '${table.key} $kind "$name": expected ${wanted[name]}, found ${actual[name]}',
+            );
+          }
+        }
+      }
+
+      compareDefinitions(
+        'index',
+        {for (final i in table.indexes) i.name: i.columns},
+        {for (final i in found.indexes) i.name: i.columns},
+      );
+      compareDefinitions(
+        'UNIQUE constraint',
+        {for (final c in table.uniqueConstraints) c.name: c.columns},
+        {for (final c in found.uniqueConstraints) c.name: c.columns},
+      );
       final columns = {for (final c in found.columns) c.name: c};
       for (final column in table.columns) {
         final actual = columns[column.name];
@@ -69,7 +98,9 @@ final class SchemaInspector {
     return List.unmodifiable(differences);
   }
 
-  Future<(SchemaSnapshot, Map<String, List<String>>)> _read() async {
+  Future<(SchemaSnapshot, Map<String, List<String>>)> _read({
+    SchemaSnapshot? expected,
+  }) async {
     requirePostgresSchema(executor);
     final columns = await executor.query('''
 SELECT n.nspname AS schema_name, c.relname AS table_name,
@@ -87,6 +118,7 @@ ORDER BY n.nspname, c.relname, a.attnum
     final constraints = await executor.query('''
 SELECT n.nspname AS schema_name, c.relname AS table_name, k.contype::text AS kind,
        k.conname AS name, k.condeferrable AS deferred, k.convalidated AS validated,
+       pg_get_constraintdef(k.oid) AS definition,
        k.confupdtype::text AS on_update, k.confdeltype::text AS on_delete, k.confmatchtype::text AS match_type,
        rn.nspname AS target_schema, rc.relname AS target_table,
        ARRAY(SELECT a.attname::text FROM unnest(k.conkey) WITH ORDINALITY x(num, ord)
@@ -101,6 +133,30 @@ LEFT JOIN pg_catalog.pg_namespace rn ON rn.oid = rc.relnamespace
 WHERE k.contype IN ('p', 'u', 'f') AND n.nspname NOT IN ('pg_catalog', 'information_schema')
 ORDER BY n.nspname, c.relname, k.conname
 ''');
+    final indexes = await executor.query('''
+SELECT n.nspname AS schema_name, c.relname AS table_name, ic.relname AS name,
+       (am.amname = 'btree' AND NOT i.indisunique AND i.indisvalid AND i.indisready
+        AND i.indpred IS NULL AND i.indexprs IS NULL AND i.indnkeyatts = i.indnatts
+        AND NOT EXISTS (SELECT 1 FROM unnest(i.indoption) opt WHERE opt <> 0)
+        AND NOT EXISTS (
+          SELECT 1 FROM unnest(i.indclass) op
+          JOIN pg_catalog.pg_opclass opc ON opc.oid = op WHERE NOT opc.opcdefault)
+        AND NOT EXISTS (
+          SELECT 1 FROM unnest(i.indkey, i.indcollation) x(num, coll)
+          JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = x.num
+          WHERE x.coll <> a.attcollation)) AS supported,
+       ARRAY(SELECT a.attname::text FROM unnest(i.indkey) WITH ORDINALITY x(num, ord)
+             JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = x.num ORDER BY x.ord) AS columns
+FROM pg_catalog.pg_index i
+JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+JOIN pg_catalog.pg_am am ON am.oid = ic.relam
+WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint k WHERE k.conindid = i.indexrelid)
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp_%'
+ORDER BY n.nspname, c.relname, ic.relname
+''');
     final constraintsByColumn = <(String, String, String), List<TikalRow>>{};
     for (final constraint in constraints.rows) {
       final schema = constraint.asString('schema_name')!;
@@ -109,10 +165,62 @@ ORDER BY n.nspname, c.relname, k.conname
         (constraintsByColumn[(schema, table, column)] ??= []).add(constraint);
       }
     }
-    final byTable = <(String, String), List<SchemaColumn>>{};
     final issues = <String, List<String>>{};
     String key(String schema, String table) =>
         '${quotedIdentifier(schema)}.${quotedIdentifier(table)}';
+    final rejected = <(String, String, String)>{};
+    final uniqueGroups = <(String, String), List<Set<String>>>{};
+    for (final constraint in constraints.rows) {
+      final schema = constraint.asString('schema_name')!;
+      final table = constraint.asString('table_name')!;
+      final keys = (constraint['columns'] as List).cast<String>();
+      if (constraint['kind'] == 'p' ||
+          constraint['kind'] == 'u' &&
+              keys.length == 1 &&
+              constraint['name'] == '${table}_${keys.single}_key') {
+        (uniqueGroups[(schema, table)] ??= []).add(keys.toSet());
+      }
+    }
+    final uniqueByTable = <(String, String), List<SchemaUniqueConstraint>>{};
+    for (final constraint in constraints.rows) {
+      if (constraint.asString('kind') != 'u') continue;
+      final table = constraint.asString('table_name')!;
+      final schema = constraint.asString('schema_name')!;
+      final keys = (constraint['columns'] as List).cast<String>();
+      final name = constraint.asString('name')!;
+      final explicitlyNamed =
+          expected?.tables.any(
+            (t) =>
+                t.name == table &&
+                (t.schema ?? 'public') == schema &&
+                t.uniqueConstraints.any((c) => c.name == name),
+          ) ??
+          false;
+      if (keys.length == 1 &&
+          name == '${table}_${keys.single}_key' &&
+          !explicitlyNamed) {
+        continue;
+      }
+      if (_unsupportedConstraint(constraint)) continue;
+      final groups = uniqueGroups[(schema, table)] ??= [];
+      final group = keys.toSet();
+      // The conventional single-column name is already represented above.
+      final conventional =
+          keys.length == 1 && name == '${table}_${keys.single}_key';
+      if (!conventional &&
+          groups.any((g) => g.length == group.length && g.containsAll(group))) {
+        rejected.add((schema, table, name));
+        (issues[key(schema, table)] ??= []).add(
+          'Redundant UNIQUE constraint ${key(schema, table)}.$name',
+        );
+        continue;
+      }
+      if (!conventional) groups.add(group);
+      (uniqueByTable[(schema, table)] ??= []).add(
+        SchemaUniqueConstraint(name: name, columns: keys),
+      );
+    }
+    final byTable = <(String, String), List<SchemaColumn>>{};
     for (final row in columns.rows) {
       final schema = row.asString('schema_name')!,
           table = row.asString('table_name')!;
@@ -126,9 +234,18 @@ ORDER BY n.nspname, c.relname, k.conname
           in constraintsByColumn[(schema, table, name)] ?? const <TikalRow>[]) {
         final keys = constraint['columns'] as List;
         final kind = constraint.asString('kind');
-        if (keys.length != 1 ||
-            constraint['deferred'] == true ||
-            constraint['validated'] != true) {
+        if (rejected.contains((schema, table, constraint.asString('name')!))) {
+          continue;
+        }
+        if (kind == 'u' &&
+            uniqueByTable[(schema, table)]?.any(
+                  (c) => c.name == constraint['name'],
+                ) ==
+                true) {
+          continue;
+        }
+        if ((keys.length != 1 && kind != 'p') ||
+            _unsupportedConstraint(constraint)) {
           (issues[tableKey] ??= []).add(
             'Incompatible constraint $tableKey.${constraint['name']}',
           );
@@ -141,15 +258,15 @@ ORDER BY n.nspname, c.relname, k.conname
               .cast<String>();
           if (reference != null ||
               targetKeys.length != 1 ||
-              constraint['on_update'] != 'a' ||
-              constraint['on_delete'] != 'a' ||
+              !const {'a', 'r', 'c', 'n'}.contains(constraint['on_update']) ||
+              !const {'a', 'r', 'c', 'n'}.contains(constraint['on_delete']) ||
               constraint['match_type'] != 's') {
             (issues[tableKey] ??= []).add(
               'Incompatible foreign key $tableKey.${constraint['name']}',
             );
           }
           reference =
-              '${key(constraint.asString('target_schema')!, constraint.asString('target_table')!)}(${targetKeys.map(quotedIdentifier).join(', ')})';
+              '${key(constraint.asString('target_schema')!, constraint.asString('target_table')!)}(${targetKeys.map(quotedIdentifier).join(', ')})${_catalogAction('DELETE', constraint['on_delete'])}${_catalogAction('UPDATE', constraint['on_update'])}';
         }
       }
       final identity = row.asString('identity') ?? '';
@@ -171,6 +288,45 @@ ORDER BY n.nspname, c.relname, k.conname
         ),
       );
     }
+    final indexesByTable = <(String, String), List<SchemaIndex>>{};
+    for (final index in indexes.rows) {
+      final schema = index.asString('schema_name')!;
+      final table = index.asString('table_name')!;
+      if (index['supported'] != true) {
+        (issues[key(schema, table)] ??= []).add(
+          'Incompatible index ${key(schema, table)}.${index['name']}',
+        );
+        continue;
+      }
+      final group = (index['columns'] as List).cast<String>().join('\u0000');
+      final implicit = <String>{
+        (byTable[(schema, table)] ?? const <SchemaColumn>[])
+            .where((c) => c.primaryKey)
+            .map((c) => c.name)
+            .join('\u0000'),
+        for (final c in byTable[(schema, table)] ?? const <SchemaColumn>[])
+          if (c.unique) c.name,
+        for (final c
+            in uniqueByTable[(schema, table)] ??
+                const <SchemaUniqueConstraint>[])
+          c.columns.join('\u0000'),
+        for (final i
+            in indexesByTable[(schema, table)] ?? const <SchemaIndex>[])
+          i.columns.join('\u0000'),
+      };
+      if (implicit.contains(group)) {
+        (issues[key(schema, table)] ??= []).add(
+          'Redundant index ${key(schema, table)}.${index['name']}',
+        );
+        continue;
+      }
+      (indexesByTable[(schema, table)] ??= []).add(
+        SchemaIndex(
+          name: index.asString('name')!,
+          columns: (index['columns'] as List).cast<String>(),
+        ),
+      );
+    }
     return (
       SchemaSnapshot([
         for (final entry in byTable.entries)
@@ -178,6 +334,8 @@ ORDER BY n.nspname, c.relname, k.conname
             name: entry.key.$2,
             schema: entry.key.$1,
             columns: entry.value,
+            indexes: indexesByTable[entry.key] ?? const [],
+            uniqueConstraints: uniqueByTable[entry.key] ?? const [],
           ),
       ]),
       issues,
@@ -222,3 +380,15 @@ String? normalizeSchemaDefault(String? expression, String type) {
     'gen_random_uuid()',
   );
 }
+
+String _catalogAction(String operation, Object? code) {
+  const actions = {'c': 'CASCADE', 'n': 'SET NULL', 'r': 'RESTRICT'};
+  return actions.containsKey(code) ? ' ON $operation ${actions[code]}' : '';
+}
+
+bool _unsupportedConstraint(TikalRow constraint) =>
+    constraint['deferred'] == true ||
+    constraint['validated'] != true ||
+    constraint.hasColumn('definition') &&
+        (constraint.asString('definition')?.contains('NULLS NOT DISTINCT') ??
+            false);

@@ -1,11 +1,7 @@
-// Database
-import 'tikal_database.dart';
+import 'dart:async';
 
-// Query
-import 'query/query_builder.dart';
-
-// Model
-import 'model/model_registry.dart';
+// Config
+import 'config/server_config.dart';
 
 // Repository
 import 'repository/repository.dart';
@@ -13,22 +9,36 @@ import 'repository/repository.dart';
 // Config
 import 'config/database_config.dart';
 
+// Database
+import 'database/query_executor.dart';
+import 'database/query_listener.dart';
+import 'database/tikal_database.dart';
+
 // Errors
 import 'errors/tikal_exceptions.dart';
 
-// Executor
-import 'executor/query_executor.dart';
-import 'executor/transaction_isolation.dart';
+// Model
+import 'model/metadata/model_registry.dart';
 
-/// Optional default database. Explicit repositories remain independent.
-abstract final class Tikal {
-  static TikalDatabase? _database;
-  static ModelRegistry? _models;
-  static Future<void>? _configuring;
-  static Future<void>? _closing;
+// Database
+import 'database/transaction_isolation.dart';
+
+/// Application client owning static model metadata and an explicitly opened database.
+/// Construction has no connection side effects; configure never reconciles schema.
+final class TikalClient {
+  /// Creates an application client without opening a connection.
+  // Keep the registry private while exposing a descriptive named argument.
+  // ignore: prefer_initializing_formals
+  TikalClient({required ModelRegistry models}) : _models = models;
+
+  TikalDatabase? _database;
+  final ModelRegistry _models;
+  Future<void>? _configuring;
+  Future<void>? _closing;
+  final _scopeKey = Object();
 
   /// The validated default connection. Await [configure] before using it.
-  static TikalDatabase get database {
+  TikalDatabase get database {
     final current = _database;
     if (current == null ||
         _configuring != null ||
@@ -42,14 +52,14 @@ abstract final class Tikal {
   }
 
   /// Opens one default pool, or adopts [connection] without creating another.
-  /// Supply exactly one of database and connection, plus optional models.
+  /// Throws [TikalUnsupportedException] before opening for unsupported model columns.
+  /// Supply exactly one of database and connection.
   /// Repeated calls with the same configuration
   /// instance or connection share initialization. Close before replacing it.
   /// [close] also closes an adopted connection.
-  static Future<void> configure({
+  Future<void> configure({
     DatabaseConfig? database,
     TikalDatabase? connection,
-    ModelRegistry? models,
   }) {
     if ((database == null) == (connection == null)) {
       throw const TikalConfigurationException(
@@ -63,11 +73,6 @@ abstract final class Tikal {
     }
     final current = _database;
     if (current != null) {
-      if (models != null && !identical(models, _models)) {
-        throw const TikalConfigurationException(
-          'Close Tikal before replacing its model registry.',
-        );
-      }
       if (!identical(current, connection) &&
           !identical(current.config, database)) {
         throw const TikalConfigurationException(
@@ -77,113 +82,187 @@ abstract final class Tikal {
       return _configuring ?? current.open();
     }
     final candidate = connection ?? TikalDatabase(database!);
+    _models.validateDialect(candidate.dialect);
     _database = candidate;
-    _models = models;
     return _configuring = _initialize(candidate)
         .whenComplete(() => _configuring = null);
   }
 
-  static Future<void> _initialize(TikalDatabase candidate) async {
+  Future<void> _initialize(TikalDatabase candidate) async {
     try {
       await candidate.open();
     } catch (_) {
       _database = null;
-      _models = null;
       await candidate.close();
       rethrow;
     }
   }
 
   /// Closes the default connection, including pending initialization.
-  static Future<void> close() =>
+  Future<void> close() =>
       _closing ??= _close().whenComplete(() => _closing = null);
 
-  static Future<void> _close() async {
+  Future<void> _close() async {
     try {
       await _configuring;
     } finally {
       final current = _database;
       _database = null;
-      _models = null;
       await current?.close();
     }
   }
 
-  /// Resolves a configured model using the default or an explicit executor.
-  /// Generated metadata is imported only at initialization. Typed column holders
-  /// still require a Dart import in modules that use them.
-  static ModelAccess<T> model<T extends Object>({QueryExecutor? executor}) {
+  /// Observes queries on the configured database, including explicit transactions.
+  /// Returns an idempotent function that unregisters the listener. Register after
+  /// configure; close clears listeners. Events omit parameters and error details.
+  void Function() onQuery(QueryListener listener) => database.onQuery(listener);
+
+  /// Explicitly creates registered tables, constraints and indexes for development/tests.
+  /// Never called by configure or queries; does not inspect, reconcile or migrate.
+  /// Existing tables cause a query error. Generated registries supply the schema;
+  /// manual registries must supply ModelRegistry.schema. Renders the entire plan
+  /// before executing SQL. PostgreSQL/SQLite creation is transactional; MySQL DDL
+  /// implicitly commits and can leave partially created objects after a failure.
+  /// Schemas/databases must already exist; by default only public PostgreSQL
+  /// schemas and the configured MySQL database are accepted. SQLite ignores schemas.
+  /// Throws [TikalConfigurationException] for missing configuration/schema metadata,
+  /// [TikalUnsupportedException] for unrepresentable DDL, or a query exception.
+  /// Set allowExistingSchemas only for PostgreSQL: every referenced namespace is
+  /// checked before DDL inside the creation transaction. Missing schemas fail;
+  /// this helper never creates namespaces or changes privileges.
+  Future<void> createTables({bool allowExistingSchemas = false}) async {
+    final db = database;
     final registry = _models;
-    if (registry == null) {
+    final schema = registry.schema;
+    if (schema == null) {
       throw const TikalConfigurationException(
-        'Configure through generated/tikal.dart, or supply models to the runtime Tikal.configure.',
+        'Explicit table creation needs schema metadata. Regenerate or supply ModelRegistry.schema.',
       );
     }
-    return ModelAccess(
-      Repository<T>(
-        executor: executor ?? database,
-        definition: registry.definitionFor<T>(),
-      ),
+    if (allowExistingSchemas && db.dialect != SqlDialect.postgres) {
+      throw const TikalUnsupportedException(
+        'allowExistingSchemas is PostgreSQL-only.',
+      );
+    }
+    final requestedSchemas = <String, String>{};
+    final config = db.config;
+    for (final table in schema.tables) {
+      final targets = <String>{table.schema ?? 'public'};
+      for (final column in table.columns) {
+        final reference = RegExp(r'^\s*"((?:[^"]|"")+)"\.')
+            .firstMatch(column.references ?? '');
+        if (reference != null) targets.add(reference[1]!.replaceAll('""', '"'));
+      }
+      for (final target in targets) {
+        final allowed = switch (db.dialect) {
+          SqlDialect.sqlite => true,
+          SqlDialect.postgres => target == 'public' || allowExistingSchemas,
+          SqlDialect.mysql =>
+            target == 'public' ||
+                config is ServerConfig && target == config.database,
+        };
+        if (allowExistingSchemas) requestedSchemas[target] = table.name;
+        if (!allowed) {
+          throw TikalConfigurationException(
+            'Table "${table.name}" uses schema "$target". createTables does not create schemas/databases. Create it explicitly and use reviewed DDL for this schema.',
+          );
+        }
+      }
+    }
+    final statements = schema.createSqlFor(
+      db.dialect,
+      definitions: registry.definitions,
+    );
+    Future<void> execute(QueryExecutor executor) async {
+      for (final entry in requestedSchemas.entries) {
+        final result = await executor.query(
+          r'SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = $1',
+          parameters: [entry.key],
+        );
+        if (result.rows.isEmpty) {
+          throw TikalConfigurationException(
+            'Table "${entry.value}" needs existing PostgreSQL schema "${entry.key}". Provision it explicitly before createTables.',
+          );
+        }
+      }
+      for (final sql in statements) {
+        await executor.execute(sql);
+      }
+    }
+
+    if (db.dialect == SqlDialect.mysql) {
+      await execute(db);
+    } else {
+      await db.transaction(execute);
+    }
+  }
+
+  /// Resolves a model using explicit executor, active transaction, then database.
+  /// Obtain repositories inside the callback; previously obtained repositories
+  /// retain their executor. Borrowed transaction repositories must not escape it.
+  /// Throws [TikalConfigurationException] when an inherited scope has finished.
+  /// The generated client supplies metadata explicitly, with no connection
+  /// side effects. Modules using typed columns still import their generated holders.
+  Repository<T> model<T extends Object>({QueryExecutor? executor}) {
+    final registry = _models;
+    return Repository<T>(
+      executor: executor ?? _currentExecutor,
+      definition: registry.definitionFor<T>(),
     );
   }
 
-  /// Inserts when the primary key is unset, otherwise updates changed values.
-  static Future<T> save<T extends Object>(
-    T value, {
-    QueryExecutor? executor,
-    Duration? timeout,
-  }) => model<T>(executor: executor).save(value, timeout: timeout);
+  QueryExecutor get _currentExecutor {
+    final scope = Zone.current[_scopeKey] as _TransactionScope?;
+    if (scope == null) return database;
+    final executor = scope.executor;
+    if (!scope.active ||
+        (executor is TransactionStateExecutor &&
+            !(executor as TransactionStateExecutor).isInTransaction)) {
+      throw const TikalConfigurationException(
+        'The inherited transaction has finished. Await all work inside its callback.',
+      );
+    }
+    return executor;
+  }
 
-  /// Finds one model by primary key, or returns null when absent.
-  static Future<T?> find<T extends Object>(
-    Object id, {
-    QueryExecutor? executor,
-    Duration? timeout,
-  }) => model<T>(executor: executor).find(id, timeout: timeout);
-
-  /// Lists all models in the default query scope.
-  static Future<List<T>> all<T extends Object>({
-    QueryExecutor? executor,
-    Duration? timeout,
-  }) => model<T>(executor: executor).repository.findAll(timeout: timeout);
-
-  /// Starts an immutable typed query on the default or explicit executor.
-  static QueryBuilder<T> query<T extends Object>({QueryExecutor? executor}) =>
-      model<T>(executor: executor).query();
-
-  /// Deletes one model, respecting its table's soft-delete behavior.
-  static Future<bool> delete<T extends Object>(
-    T value, {
-    QueryExecutor? executor,
-    Duration? timeout,
-  }) => model<T>(executor: executor).delete(value, timeout: timeout);
-
-  /// Delegates to the default database. Use the supplied executor explicitly;
-  /// global queries keep using the default pool, even inside this callback.
-  static Future<T> transaction<T>(
+  /// Runs awaited work in a transaction inherited by model() calls in this Zone.
+  /// Nested calls use the active executor's savepoint support. Explicit executors
+  /// always win. Outside the callback, model() uses the default database again.
+  /// Errors propagate after rollback; encoded model snapshots are not rewound.
+  /// Throws [TikalUnsupportedException] if the active executor cannot nest.
+  Future<T> transaction<T>(
     Future<T> Function(QueryExecutor tx) action, {
     TransactionIsolation? isolation,
     bool readOnly = false,
     Duration? timeout,
-  }) => database.transaction(
-    action,
-    isolation: isolation,
-    readOnly: readOnly,
-    timeout: timeout,
-  );
+  }) {
+    final executor = _currentExecutor;
+    if (executor is! TransactionExecutor) {
+      throw const TikalUnsupportedException(
+        'The active executor does not support transactions or savepoints.',
+      );
+    }
+    return (executor as TransactionExecutor).transaction(
+      (tx) async {
+        final scope = _TransactionScope(tx);
+        try {
+          return await runZoned(
+            () => action(tx),
+            zoneValues: {_scopeKey: scope},
+          );
+        } finally {
+          scope.active = false;
+        }
+      },
+      isolation: isolation,
+      readOnly: readOnly,
+      timeout: timeout,
+    );
+  }
 }
 
-/// Typed model entry point. This extension type allocates no wrapper and delegates
-/// all persistence to [repository]. Repository.find keeps its existing filtered
-/// list signature; this facade's find delegates to Repository.findById.
-extension type ModelAccess<T extends Object>(Repository<T> repository) {
-  QueryBuilder<T> query() => repository.query();
-  Future<T?> find(Object id, {Duration? timeout}) =>
-      repository.findById(id, timeout: timeout);
-  Future<T> create(T model, {Duration? timeout}) =>
-      repository.insert(model, timeout: timeout);
-  Future<T> save(T model, {Duration? timeout}) =>
-      repository.save(model, timeout: timeout);
-  Future<bool> delete(T model, {Duration? timeout}) =>
-      repository.delete(model, timeout: timeout);
+final class _TransactionScope {
+  _TransactionScope(this.executor);
+  final QueryExecutor executor;
+  bool active = true;
 }

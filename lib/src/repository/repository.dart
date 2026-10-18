@@ -1,46 +1,43 @@
-// Repository
+// Model
 import 'write_strategy.dart';
 
 // Query
-import '../query/dialect.dart';
-import '../query/order_by.dart';
-import '../query/sql_writer.dart';
 import '../query/query_builder.dart';
-import '../query/sql_predicate.dart';
+import '../query/sql/sql_writer.dart';
+import '../query/dialects/dialect.dart';
 
-// Model
-import '../model/table_definition.dart';
+// Database
+import '../database/query_executor.dart';
 
 // Errors
 import '../errors/tikal_exceptions.dart';
 
-// Executor
-import '../executor/query_executor.dart';
+// Query
+import '../query/expressions/order_by.dart';
+
+// Database
+import '../database/transaction_isolation.dart';
 
 // Model
-import '../model/column_definition.dart';
+import '../model/metadata/table_definition.dart';
 
-// Executor
-import '../executor/transaction_isolation.dart';
+// Query
+import '../query/expressions/sql_predicate.dart';
 
-/// Reads and writes models of type [TModel] through a [QueryExecutor].
-///
-/// The repository is created explicitly, because Dart has no runtime reflection:
-/// it needs the [definition] that describes the table.
-///
-/// Every statement is parameterised; no user value is ever interpolated into
-/// the SQL. Predicates bind their values using the column's SQL type, so
-/// `uuid`, `numeric`, `date` and other columns compare correctly.
+// Model
+import '../model/metadata/column_definition.dart';
+
+/// Persistence, validation, clocks and lifecycle hooks for one model mapping.
+/// Explicit executors keep this path independent from application clients.
 final class Repository<TModel extends Object> {
   /// Creates a repository that runs its statements through [executor].
+  /// Throws [TikalUnsupportedException] for unsupported column bindings.
   ///
   /// [clock] supplies the current time for timestamps and soft deletes and
   /// defaults to [DateTime.now]; pass a fixed function in tests.
-  const Repository({
-    required this.executor,
-    required this.definition,
-    this.clock,
-  });
+  Repository({required this.executor, required this.definition, this.clock}) {
+    definition.validateDialect(executor.dialect);
+  }
 
   /// The executor statements are sent to.
   ///
@@ -55,12 +52,11 @@ final class Repository<TModel extends Object> {
   /// Source of the current time for `createdAt` / `updatedAt` and soft deletes.
   final DateTime Function()? clock;
 
-  DateTime _now() => (clock ?? DateTime.now)();
+  DateTime _now() => (clock ?? DateTime.now)().toUtc();
 
   /// Returns a repository bound to [executor], sharing this definition.
   ///
-  /// Handy to run several operations on the same transaction:
-  ///
+  /// Use this when a callback supplies a transaction or borrowed session.
   Repository<TModel> usingExecutor(QueryExecutor executor) =>
       Repository<TModel>(
         executor: executor,
@@ -69,15 +65,15 @@ final class Repository<TModel extends Object> {
       );
 
   /// Starts a fluent `SELECT` for this model with no clauses yet.
-  ///
-  QueryBuilder<TModel> query() =>
-      QueryBuilder<TModel>(executor: executor, definition: definition);
+  QueryBuilder<TModel> query() => QueryBuilder<TModel>(
+    executor: executor,
+    definition: definition,
+    clock: clock,
+  );
 
   /// Starts a fluent `SELECT` filtered by [predicate].
   ///
-  /// This is what makes `User.query(db).where(...)` read as one sentence: the
-  /// model's static `query(db)` returns a repository and this hands back a
-  /// [QueryBuilder] seeded with the first condition.
+  /// Returns an immutable [QueryBuilder] seeded with the first condition.
   QueryBuilder<TModel> where(SqlPredicate<TModel> predicate) =>
       query().where(predicate);
 
@@ -112,11 +108,12 @@ final class Repository<TModel extends Object> {
   }
 
   /// Inserts [model] and returns it, populated from the returned row.
+  /// A version counter is initialized to one, replacing any supplied value.
   ///
   /// The write strategy populates server-generated values on [model]. When the
   /// table declares `createdAt` / `updatedAt` columns, both are stamped with the
-  /// current time unless already set. Lifecycle hooks ([TikalModel.beforeInsert]
-  /// / [TikalModel.afterInsert]) run around the statement.
+  /// current time unless already set. Lifecycle hooks (`ModelLifecycle.beforeInsert`
+  /// / `ModelLifecycle.afterInsert`) run around the statement.
   Future<TModel> insert(TModel model, {Duration? timeout}) async =>
       _persist(model, timeout, runHooks: true);
 
@@ -126,8 +123,17 @@ final class Repository<TModel extends Object> {
   /// The column list is the union of the columns that carry a value in at least
   /// one model plus every required column. A model that omits an included
   /// column binds `NULL` for it, which must be allowed by the column (nullable
-  /// or defaulted). Rows are returned in the order the database returns them,
-  /// which for a single `INSERT ... RETURNING` matches the input order.
+  /// or defaulted). PostgreSQL/SQLite use parameter-bounded RETURNING batches;
+  /// MySQL retains single-row inserts with key reloads. Results follow input
+  /// order using bound keys/values to correlate RETURNING rows; unmatched values
+  /// transformed by triggers/collations retain database order within their batch.
+  /// Inputs receive no generated fields or snapshots before the operation succeeds.
+  /// Use the returned rows for generated values on PostgreSQL/SQLite.
+  ///
+  /// All statements run in one transaction/savepoint. Throws
+  /// [TikalUnsupportedException] before SQL if a row exceeds the parameter limit
+  /// or the executor lacks [TransactionExecutor]. Decode failures also roll back.
+  /// A later rollback of an outer transaction does not rewind published snapshots.
   ///
   /// Timestamps are applied to every model, but **lifecycle hooks do not run**
   /// for bulk inserts; use [insert] when a model needs its hooks.
@@ -137,25 +143,15 @@ final class Repository<TModel extends Object> {
   }) async {
     final list = models.toList(growable: false);
     if (list.isEmpty) return [];
-    return _writes.insertAll(
-      list,
-      () => _prepareInsert(list),
-      _writeWithoutHooks(timeout),
-      timeout,
-    );
+    return _writes.insertAll(list, () => _prepareInsert(list), timeout);
   }
 
   WriteStrategy<TModel> get _writes =>
-      dialectOf(executor).strategy.supportsReturning
+      executor.dialect.strategy.supportsReturning
       ? ReturningWriteStrategy(executor, definition)
       : ReloadWriteStrategy(executor, definition);
 
-  SingleWrite<TModel> _writeWithoutHooks(Duration? timeout) =>
-      (tx, model, spec) =>
-          usingExecutor(tx)
-              ._persist(model, timeout, runHooks: false, spec: spec);
-
-  /// Inserts or updates [models] with a single `INSERT ... ON CONFLICT`.
+  /// Inserts or updates [models] using parameter-bounded conflict batches.
   ///
   /// Conflicting rows are matched on [conflictColumns], which must correspond to
   /// a unique index or the primary key. Matching rows are updated with the
@@ -164,16 +160,19 @@ final class Repository<TModel extends Object> {
   /// (`DO NOTHING`). [updateColumns] defaults to every inserted column that is
   /// neither part of the conflict target nor a primary key.
   ///
+  /// Throws [TikalUnsupportedException] for versioned models.
   /// Timestamps are applied; like [insertAll], lifecycle hooks do not run.
   /// MySQL uses ON DUPLICATE KEY on any unique index. conflictColumns serves
   /// only to reload each result; a different unique conflict may fail the reload.
   /// MySQL performs individual statements in a transaction/savepoint.
+  /// The atomicity, result ordering and executor requirements of [insertAll] apply.
   Future<List<TModel>> upsert(
     Iterable<TModel> models, {
     required List<ColumnDefinition> conflictColumns,
     List<ColumnDefinition>? updateColumns,
     Duration? timeout,
   }) async {
+    _rejectVersionedBulk();
     if (conflictColumns.isEmpty) {
       throw ArgumentError.value(
         conflictColumns,
@@ -194,7 +193,6 @@ final class Repository<TModel extends Object> {
       list,
       (columns, valueMaps),
       UpsertSpec(conflictColumns, updateColumns),
-      _writeWithoutHooks(timeout),
       timeout,
     );
   }
@@ -224,6 +222,12 @@ final class Repository<TModel extends Object> {
 
   /// Updates the row that [model]'s primary key identifies.
   ///
+  /// Versioned models atomically increment their counter and check the persisted
+  /// version (or the supplied version for detached models). The counter must be
+  /// positive and must not be edited. Throws [TikalConcurrencyException] when the
+  /// key/version pair no longer matches, including a concurrently deleted row.
+  /// Clean models perform no SQL and do not increment their version.
+  ///
   /// When [model] was loaded from the database (or written by a previous save),
   /// only the columns that actually changed are written, so concurrent edits to
   /// other columns are not clobbered; pass `onlyChanged: false` to write every
@@ -231,8 +235,8 @@ final class Repository<TModel extends Object> {
   /// non-key columns. When nothing changed, no statement is sent.
   ///
   /// When the table declares an `updatedAt` column it is stamped with the
-  /// current time. Lifecycle hooks ([TikalModel.beforeUpdate] /
-  /// [TikalModel.afterUpdate]) run around the statement. When no row matches,
+  /// current time. Lifecycle hooks (`ModelLifecycle.beforeUpdate` /
+  /// `ModelLifecycle.afterUpdate`) run around the statement. When no row matches,
   /// a [TikalEntityNotFoundException] is thrown. The returned model reflects the
   /// row after the update.
   Future<TModel> update(
@@ -270,42 +274,109 @@ final class Repository<TModel extends Object> {
     // Degenerate table with only key columns: perform a no-op assignment.
     final effective = targets.isEmpty ? <ColumnDefinition>[key] : targets;
 
-    final dialect = dialectOf(executor);
-    final writer = SqlWriter(dialect: dialect)
-      ..write('UPDATE ${definition.qualifiedNameFor(dialect)} SET ');
-    for (final (index, column) in effective.indexed) {
-      if (index > 0) writer.write(', ');
-      writer
-        ..writeIdentifier(column.name)
-        ..write(' = ');
-      writer.bindTyped(column.sqlType, values[column.name]);
-    }
-    _writeKeyWhere(writer, key, values[key.name]);
-    final result = await _writes.update(model, writer, timeout: timeout);
+    final result = await _updateValues(model, values, effective, timeout);
     await definition.lifecycleFor(model)?.afterUpdate();
     return result;
   }
 
-  /// Alias for [insert], matching the model lookup API.
-  Future<TModel> create(TModel model, {Duration? timeout}) =>
-      insert(model, timeout: timeout);
-
-  /// Inserts [model] when its primary key is unset, otherwise updates it.
-  Future<TModel> save(TModel model, {Duration? timeout}) {
+  Future<TModel> _updateValues(
+    TModel model,
+    Map<String, Object?> values,
+    List<ColumnDefinition> targets,
+    Duration? timeout,
+  ) {
+    final version = definition.versionColumn;
+    int? expected;
+    if (version != null) {
+      final snapshot = definition.state.originalValues(model);
+      final current = definition.readColumn(model, version);
+      final original = snapshot?[version.name] ?? current;
+      if (original is! int || original < 1 || current != original) {
+        throw TikalValidationException([
+          'Version must be a positive integer and cannot be edited.',
+        ]);
+      }
+      expected = original;
+    }
+    final dialect = executor.dialect;
+    final writer = SqlWriter(dialect: dialect)
+      ..write('UPDATE ${definition.qualifiedNameFor(dialect)} SET ');
+    var index = 0;
+    for (final column in targets.where((c) => c != version)) {
+      if (index++ > 0) writer.write(', ');
+      writer
+        ..writeIdentifier(column.name)
+        ..write(' = ');
+      writer.bindTyped(
+        column.sqlType,
+        definition.encodeWriteValue(column, values[column.name]),
+      );
+    }
+    if (version != null) {
+      if (index > 0) writer.write(', ');
+      writer
+        ..writeIdentifier(version.name)
+        ..write(' = ')
+        ..writeIdentifier(version.name)
+        ..write(' + 1');
+    }
     final key = definition.singlePrimaryKey;
-    final value = definition.readColumn(model, key);
-    return value == null
-        ? insert(model, timeout: timeout)
-        : update(model, timeout: timeout);
+    _writeKeyWhere(writer, key, values[key.name]);
+    if (version != null) {
+      writer
+        ..write(' AND ')
+        ..writeIdentifier(version.name)
+        ..write(' = ');
+      writer.bindTyped(version.sqlType, expected);
+    }
+    return _writes.update(
+      model,
+      writer,
+      timeout: timeout,
+      expectedVersion: expected,
+    );
   }
+
+  void _rejectVersionedBulk() {
+    if (definition.versionColumn != null) {
+      throw const TikalUnsupportedException(
+        'Versioned models require individual updates; bulk writes and upserts cannot check each version.',
+      );
+    }
+  }
+
+  Future<bool> _versionedSoftWrite(
+    TModel model,
+    Object? deletedValue,
+    Duration? timeout,
+  ) async {
+    final deleted = definition.deletedAtColumn!;
+    final updated = definition.updatedAtColumn;
+    final values = definition.readValues(model)..[deleted.name] = deletedValue;
+    if (updated != null) {
+      values[updated.name] = deletedValue is DateTime ? deletedValue : _now();
+    }
+    await _updateValues(model, values, [deleted, ?updated], timeout);
+    return true;
+  }
+
+  /// Inserts a model with no persisted snapshot, even if its key is assigned.
+  /// Loaded or previously written models use change-based updates instead.
+  Future<TModel> save(TModel model, {Duration? timeout}) =>
+      definition.isPersisted(model)
+      ? update(model, timeout: timeout)
+      : insert(model, timeout: timeout);
 
   /// Deletes the row identified by [model]'s primary key.
   ///
   /// When the table supports soft deletes, the row is marked (its soft-delete
   /// column is set to the current time) and [model] is updated to match; use
   /// [forceDelete] to remove it for good. Returns whether a row was affected.
-  /// Lifecycle hooks ([TikalModel.beforeDelete] / [TikalModel.afterDelete]) run
+  /// Lifecycle hooks (`ModelLifecycle.beforeDelete` / `ModelLifecycle.afterDelete`) run
   /// around the statement.
+  /// Physical deletion of versioned models checks the original snapshot version
+  /// (or the supplied positive version for detached models). Throws
+  /// [TikalConcurrencyException] when the key/version pair no longer matches.
   Future<bool> delete(TModel model, {Duration? timeout}) async {
     await definition.lifecycleFor(model)?.beforeDelete();
     final deleted = definition.deletedAtColumn;
@@ -314,12 +385,51 @@ final class Repository<TModel extends Object> {
 
     final bool affected;
     if (deleted == null) {
-      affected = await _hardDeleteByKey(key, value, timeout);
+      final version = definition.versionColumn;
+      if (version == null) {
+        affected = await _hardDeleteByKey(key, value, timeout);
+      } else {
+        final original =
+            definition.state.originalValues(model)?[version.name] ??
+            definition.readColumn(model, version);
+        if (original is! int || original < 1) {
+          throw TikalValidationException([
+            'Version must be a positive integer.',
+          ]);
+        }
+        final writer = SqlWriter(dialect: executor.dialect)
+          ..write(
+            'DELETE FROM ${definition.qualifiedNameFor(executor.dialect)}',
+          );
+        _writeKeyWhere(writer, key, value);
+        writer
+          ..write(' AND ')
+          ..writeIdentifier(version.name)
+          ..write(' = ');
+        writer.bindTyped(version.sqlType, original);
+        final count = await executor.execute(
+          writer.sql,
+          parameters: writer.parameters,
+          timeout: timeout,
+        );
+        if (count == 0) {
+          throw TikalConcurrencyException(
+            table: definition.name,
+            expectedVersion: original,
+          );
+        }
+        affected = true;
+      }
     } else {
       final stamp = _now();
-      affected = await _softDeleteByKey(key, value, deleted, stamp, timeout);
+      affected = definition.versionColumn != null
+          ? await _versionedSoftWrite(model, stamp, timeout)
+          : await _softDeleteByKey(key, value, deleted, stamp, timeout);
       if (affected) {
         definition.writeColumn(model, deleted, stamp);
+        if (definition.updatedAtColumn case final updated?) {
+          definition.writeColumn(model, updated, stamp);
+        }
         definition.syncOriginal(model);
       }
     }
@@ -330,17 +440,24 @@ final class Repository<TModel extends Object> {
   /// Deletes the row whose primary key equals [id].
   ///
   /// Soft-deletes when the table supports it. Returns whether a row was
-  /// affected.
+  /// affected. Versioned soft deletes require [delete] with a model;
+  /// throws [TikalUnsupportedException] when only the key is supplied.
+  /// Accepts the Dart primary-key value, including converted domain keys.
+  /// No second key generic is required. Invalid types throw [TikalModelException]
+  /// before SQL, naming the table, column and received type.
   Future<bool> deleteById(Object id, {Duration? timeout}) {
     final deleted = definition.deletedAtColumn;
     final key = definition.singlePrimaryKey;
+    definition.validateKeyValue(key, id);
     if (deleted == null) return _hardDeleteByKey(key, id, timeout);
+    _rejectVersionedBulk();
     return _softDeleteByKey(key, id, deleted, _now(), timeout);
   }
 
   /// Permanently removes [model]'s row with a real `DELETE`.
   ///
-  /// Use it to bypass soft deletes. Lifecycle hooks run around the statement.
+  /// Bypasses soft deletes and optimistic version checks, including for versioned
+  /// models. Lifecycle hooks run around the statement.
   Future<bool> forceDelete(TModel model, {Duration? timeout}) async {
     await definition.lifecycleFor(model)?.beforeDelete();
     final key = definition.singlePrimaryKey;
@@ -354,10 +471,14 @@ final class Repository<TModel extends Object> {
   }
 
   /// Permanently removes the row whose primary key equals [id].
+  /// Accepts the Dart primary-key value, including converted domain keys.
+  /// No second key generic is required. Invalid types throw [TikalModelException]
+  /// before SQL, naming the table, column and received type.
   Future<bool> forceDeleteById(Object id, {Duration? timeout}) =>
       _hardDeleteByKey(definition.singlePrimaryKey, id, timeout);
 
   void _writeKeyWhere(SqlWriter writer, ColumnDefinition key, Object? value) {
+    definition.validateKeyValue(key, value);
     writer.write(' WHERE ');
     _KeyFilter<TModel>(key, value, null).writeTo(writer);
   }
@@ -367,8 +488,17 @@ final class Repository<TModel extends Object> {
     Object? value,
     Duration? timeout, {
     bool excludeDeleted = false,
+    DateTime Function()? clockOverride,
   }) {
-    final builder = query().withTrashed().where(
+    definition.validateKeyValue(key, value);
+    final base = clockOverride == null
+        ? query()
+        : QueryBuilder<TModel>(
+            executor: executor,
+            definition: definition,
+            clock: clockOverride,
+          );
+    final builder = base.withTrashed().where(
       _KeyFilter<TModel>(
         key,
         value,
@@ -389,6 +519,9 @@ final class Repository<TModel extends Object> {
         'Table "${definition.name}" does not support soft deletes.',
       );
     }
+    if (definition.versionColumn != null) {
+      return _versionedSoftWrite(model, null, timeout);
+    }
     final key = definition.singlePrimaryKey;
     final affected = await _byKey(
       key,
@@ -406,6 +539,9 @@ final class Repository<TModel extends Object> {
   ///
   /// Soft-deleted rows are treated as absent; use `withTrashed().where(...)` or
   /// `onlyTrashed()` to reach them.
+  /// Accepts the Dart primary-key value, including converted domain keys.
+  /// No second key generic is required. Invalid types throw [TikalModelException]
+  /// before SQL, naming the table, column and received type.
   Future<TModel?> findById(Object id, {Duration? timeout}) async {
     final statement = _byKey(
       definition.singlePrimaryKey,
@@ -423,6 +559,9 @@ final class Repository<TModel extends Object> {
   }
 
   /// Like [findById] but throws [TikalEntityNotFoundException] when absent.
+  /// Accepts the Dart primary-key value, including converted domain keys.
+  /// No second key generic is required. Invalid types throw [TikalModelException]
+  /// before SQL, naming the table, column and received type.
   Future<TModel> requireById(Object id, {Duration? timeout}) async =>
       await findById(id, timeout: timeout) ??
       (throw TikalEntityNotFoundException(
@@ -503,7 +642,8 @@ final class Repository<TModel extends Object> {
         value,
         timeout,
         excludeDeleted: true,
-      ).update({deleted: stamp}) >
+        clockOverride: () => stamp,
+      ).delete() >
       0;
 
   (List<ColumnDefinition>, List<Map<String, Object?>>) _prepareInsert(
@@ -513,13 +653,22 @@ final class Repository<TModel extends Object> {
       _validate(model, forInsert: true);
     }
     final now = _now();
+    final valueMaps = <Map<String, Object?>>[];
+    final writes = _writes;
     for (final model in list) {
-      _stampInsert(model, now);
+      final values = definition.readValues(model);
+      if (definition.versionColumn case final version?) {
+        values[version.name] = 1;
+      }
+      if (definition.createdAtColumn case final created?) {
+        values[created.name] ??= now;
+      }
+      if (definition.updatedAtColumn case final updated?) {
+        values[updated.name] = now;
+      }
+      writes.prepareGeneratedValues(values);
+      valueMaps.add(values);
     }
-
-    final valueMaps = <Map<String, Object?>>[
-      for (final model in list) definition.readValues(model),
-    ];
     final columns = <ColumnDefinition>[
       for (final column in definition.columns)
         if (column.required ||
@@ -528,6 +677,12 @@ final class Repository<TModel extends Object> {
     ];
 
     return (columns, valueMaps);
+  }
+
+  void _initializeVersion(TModel model) {
+    if (definition.versionColumn case final version?) {
+      definition.writeColumn(model, version, 1);
+    }
   }
 
   void _stampInsert(TModel model, DateTime now) {
@@ -555,13 +710,13 @@ final class Repository<TModel extends Object> {
     TModel model,
     Duration? timeout, {
     required bool runHooks,
-    UpsertSpec? spec,
   }) async {
+    _initializeVersion(model);
     _validate(model, forInsert: true);
     if (runHooks) await definition.lifecycleFor(model)?.beforeInsert();
     _stampInsert(model, _now());
     _validate(model, forInsert: true);
-    final result = await _writes.insert(model, spec: spec, timeout: timeout);
+    final result = await _writes.insert(model, timeout: timeout);
     if (runHooks) await definition.lifecycleFor(model)?.afterInsert();
     return result;
   }

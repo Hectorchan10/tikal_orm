@@ -1,236 +1,90 @@
 # TikalORM
 
-> A lightweight, strongly-typed Object-Relational Mapper (ORM) for Dart supporting PostgreSQL, SQLite, and MySQL/MariaDB.
+A framework-neutral Dart ORM for PostgreSQL, SQLite and MySQL/MariaDB.
+Version **0.2.0** requires Dart **3.13.5+**. One package, static generation, no reflection.
 
-```text
-████████╗██╗██╗  ██╗ █████╗ ██╗      ██████╗ ██████╗ ███╗   ███╗
-╚══██╔══╝██║██║ ██╔╝██╔══██╗██║     ██╔═══██╗██╔══██╗████╗ ████║
-   ██║   ██║█████╔╝ ███████║██║     ██║   ██║██████╔╝██╔████╔██║
-   ██║   ██║██╔═██╗ ██╔══██║██║     ██║   ██║██╔══██╗██║╚██╔╝██║
-   ██║   ██║██║  ██╗██║  ██║███████╗╚██████╔╝██║  ██║██║ ╚═╝ ██║
-   ╚═╝   ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝
-```
+## Install
 
-[![Dart Version](https://img.shields.io/badge/Dart-3.13.5%2B-blue.svg)](https://dart.dev)
-
----
-
-## 📌 Requirements
-
-* **Dart SDK:** `3.13.5` or higher.
-
----
-
-## 🚀 Installation
-
-Add `tikal_orm` to your project dependencies:
-
-```bash
+```sh
 dart pub add tikal_orm
 ```
 
----
+## Define a model
 
-## 🛠️ Getting Started
-
-### 1. Define a Model
-
-Create your model file in `lib/models/user.dart`:
+Create `lib/models/user.dart`:
 
 ```dart
 import 'package:tikal_orm/tikal_orm.dart';
 
 @TikalTable('users')
 class User {
-  User({this.id, required this.name, required this.email});
-
   @PrimaryKey(autoIncrement: true)
   int? id;
-
   String name;
-
   @Unique()
   String email;
+  @Version()
+  int version = 1;
 }
 ```
 
----
+No constructor is required in the model source before generation. `generate`
+adds named parameters automatically: nullable fields are optional, and non-null
+fields without defaults are required. Literal field defaults, `@Default` and
+`@Version` are respected. Relation lists keep their field initializers.
 
-### 2. Code Generation
+The generated constructor carries a comment marker and updates when fields change.
+Remove that marker before customizing the constructor yourself; manual constructors
+are preserved. Run generation before analyzing or building the consuming app.
 
-Run the code generator to generate the static registry and query helpers:
+## Generate
 
-```bash
+```sh
 dart run tikal_orm:tikal generate
 ```
 
-> **Tip:** Use the watch flag to automatically regenerate files when saving changes:
-> ```bash
-> dart run tikal_orm:tikal generate --watch
-> ```
-> *Models are registered automatically—no need to manually pass `models:`.*
+Generation creates `lib/generated/tikal.dart` and the application entry `lib/tikal.dart`.
+Generate before analyzing/building the app. See [generation and editor setup](docs/typed-queries.md#generate).
 
----
-
-### 3. Configure and Connect
+## Connect and query
 
 ```dart
 import 'models/user.dart';
-import 'generated/tikal.dart';
+import 'tikal.dart';
 
 Future<void> main() async {
-  // Configure database connection
-  await Tikal.configure(
-    database: PostgresConfig(
-      host: 'localhost',
-      port: 5432,
-      database: 'my_database',
-      username: 'my_username',
-      password: 'my_password',
-    ),
-  );
-
+  await Tikal.configure(database: SqliteConfig(path: 'app.db'));
+  final remove = Tikal.onQuery((event) => print(event.sql));
   try {
-    // Insert a record
-    final user = await Tikal.save(
-      User(name: 'Ana', email: 'ana@example.com'),
-    );
-
-    // Fetch records
-    final found = await Tikal.find<User>(user.id!);
-    final users = await Tikal.all<User>();
-
-    // Update record
+    final user = await Tikal.model<User>().save(User(name: 'Ana', email: 'ana@example.com'));
     user.name = 'Ana María';
-    await Tikal.save(user);
-
-    // Delete record
-    await Tikal.delete(user);
+    await Tikal.model<User>().save(user);
+    final users = await Tikal.model<User>().query()
+        .where(User_.name.startsWith('Ana'))
+        .orderBy(User_.id)
+        .get();
+    print(users.length);
   } finally {
+    remove();
     await Tikal.close();
   }
 }
 ```
 
-> ⚠️ **Note:** `configure()` does not automatically create database tables. Tables must exist before performing CRUD operations.
+Tables must already exist. Configuration and queries never create or reconcile schema.
+`@Version` guards individual updates and `delete(model)`, including physical deletion.
+Resolve `TikalConcurrencyException` explicitly. `forceDelete(model)` deliberately
+bypasses both soft deletion and version checks. Key-only hard deletes are unchanged.
 
----
+## Documentation
 
-## 🗄️ Supported Drivers
-
-<details>
-<summary><b>SQLite</b></summary>
-
-```dart
-await Tikal.configure(
-  database: SqliteConfig(path: 'app.db'),
-);
-```
-</details>
-
-<details>
-<summary><b>MySQL / MariaDB</b></summary>
-
-```dart
-await Tikal.configure(
-  database: MysqlConfig(
-    host: 'localhost',
-    port: 3306,
-    database: 'my_database',
-    username: 'my_username',
-    password: 'my_password',
-  ),
-);
-```
-</details>
-
-<details>
-<summary><b>PostgreSQL</b></summary>
-
-```dart
-await Tikal.configure(
-  database: PostgresConfig(
-    host: 'localhost',
-    port: 5432,
-    database: 'my_database',
-    username: 'my_username',
-    password: 'my_password',
-  ),
-);
-```
-*Note: Schema inspection and migrations are currently available exclusively for PostgreSQL.*
-</details>
-
----
-
-## 🔍 Query Builder
-
-TikalORM provides type-safe query building out of the box:
-
-```dart
-final users = await Tikal.query<User>()
-    .where(User_.name.equals('Ana'))
-    .orderBy(User_.email)
-    .get();
-```
-
----
-
-## 🌱 Database Seeders
-
-### Create Seeders
-
-Generate seeder classes using the CLI:
-
-```bash
-dart run tikal_orm:tikal make:seeder UserSeeder
-dart run tikal_orm:tikal make:seeder DatabaseSeeder
-```
-
-### Implement Logic
-
-**1. Individual Seeder** (`lib/seeders/user_seeder.dart`):
-
-```dart
-import 'package:tikal_orm/tikal_orm.dart';
-import '../models/user.dart';
-
-@Seeder()
-class UserSeeder {
-  Future<void> run() async {
-    await Tikal.save(User(name: 'Admin', email: 'admin@example.com'));
-  }
-}
-```
-
-**2. Main Seeder Runner** (`lib/seeders/database_seeder.dart`):
-
-```dart
-import 'package:tikal_orm/tikal_orm.dart';
-import 'user_seeder.dart';
-
-@Seeder(calls: [UserSeeder])
-class DatabaseSeeder {}
-```
-
-> Configure your database connection directly inside `bin/tikal_seed.dart` (or import your existing config). This file is created once and will not be overwritten.
-
-### Run Seeders
-
-```bash
-# 1. Regenerate code to register seeders
-dart run tikal_orm:tikal generate
-
-# 2. Run all seeders (defaults to DatabaseSeeder)
-dart run tikal_orm:tikal db:seed
-
-# Run a specific seeder class
-dart run tikal_orm:tikal db:seed --class=UserSeeder
-```
-
-### 💡 Seeder Rules & Behavior
-* **Reflection-Free / AOT Compatible:** The CLI executes `bin/tikal_seed.dart` using static imports without dynamic reflection.
-* **Constructor:** Every seeder class requires an unnamed public constructor with no mandatory parameters.
-* **Execution:** `Future<void> run()` is required unless the class delegates entirely via `calls`.
-* **Execution Order:** `calls` execute sequentially before the local `run()` method.
-* **Error Handling:** Errors stop execution immediately. Ensure your seeders manage duplicate prevention or transactions if needed.
+- [Engines and supported field types](docs/engines.md)
+- [Typed queries, generation and conventions](docs/typed-queries.md)
+- [Transactions](docs/transactions.md)
+- [Schema, explicit DDL, bulk writes and indexes](docs/schema-and-ddl.md)
+- [Relations and seeders](docs/relations-and-seeders.md)
+- [Constraint errors and safe logging](docs/errors.md)
+- [Internal layout and invariants](docs/internal-layout.md)
+- [Public API](lib/tikal_orm.dart)
+- [Migration notes](CHANGELOG.md)
+- [Dependencies and performance decisions](docs/dependencies-and-performance.md)

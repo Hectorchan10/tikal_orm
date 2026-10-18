@@ -21,7 +21,6 @@ Iterable<File> _modelSources(File source, Directory root) sync* {
       .where(
         (file) =>
             file.path.endsWith('.dart') &&
-            !file.path.endsWith('.tikal.dart') &&
             file.absolute.path != output.absolute.path,
       );
 }

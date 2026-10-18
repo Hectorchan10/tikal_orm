@@ -8,22 +8,24 @@ import 'schema.dart';
 import 'schema_inspector.dart' show SchemaInspector;
 
 // Database
-import '../tikal_database.dart';
+import '../database/query_executor.dart';
 
 // Errors
 import '../errors/tikal_exceptions.dart';
 
-// Executor
-import '../executor/query_executor.dart';
-import '../executor/transaction_isolation.dart';
+// Database
+import '../database/transaction_isolation.dart';
 
 /// A migration failed validation before executing its SQL.
 final class TikalMigrationException extends TikalException {
+  /// Creates a validation error for a migration or its recorded history.
   const TikalMigrationException(super.message);
 }
 
 /// A versioned, reviewable migration; its checksum covers SQL and snapshot.
 final class Migration {
+  /// Creates a migration with immutable SQL operations and a schema snapshot.
+  /// Throws TikalMigrationException if its timestamp-based identifier is malformed.
   Migration({
     required this.id,
     required Iterable<String> up,
@@ -37,9 +39,20 @@ final class Migration {
       throw TikalMigrationException('Invalid migration identifier: $id');
     }
   }
+
+  /// Stable timestamp-based migration identifier, including its descriptive name.
   final String id;
-  final List<String> up, down;
+
+  /// Ordered SQL operations applied when moving forward.
+  final List<String> up;
+
+  /// Ordered SQL operations applied when rolling back.
+  final List<String> down;
+
+  /// Expected managed schema after applying this migration.
   final SchemaSnapshot snapshot;
+
+  /// Whether rollback removes schema objects or data.
   final bool requiresReview, destructiveDown;
   Map<String, Object?> get _payload => {
     'version': 1,
@@ -50,9 +63,16 @@ final class Migration {
     'destructiveDown': destructiveDown,
     'snapshot': snapshot.toJson(),
   };
+
+  /// SHA-256 digest of the versioned SQL operations, flags and schema snapshot.
   String get checksum =>
       sha256.convert(utf8.encode(jsonEncode(_payload))).toString();
+
+  /// Returns the versioned JSON representation used by migration tooling.
   Map<String, Object?> toJson() => {..._payload, 'checksum': checksum};
+
+  /// Reconstructs and validates the serialized representation.
+  /// Malformed fields, unsupported versions or checksum mismatches are rejected.
   factory Migration.fromJson(Map<String, Object?> j) {
     if (j['version'] != 1) {
       throw TikalMigrationException('Unsupported migration format.');
@@ -75,8 +95,14 @@ final class Migration {
 }
 
 /// Runs explicitly requested PostgreSQL migrations, under a transaction lock.
-/// No schema work runs during normal application startup.
+/// No schema work runs during normal application startup. History checksums are
+/// verified before applying or rolling back operations. Unknown/modified history,
+/// unsafe changes without permission and invalid rollback plans throw
+/// TikalMigrationException. SQLite/MySQL are rejected with TikalUnsupportedException.
+/// All operations run through the supplied transaction-capable executor.
 final class MigrationRunner {
+  /// Creates a PostgreSQL migration runner over execution/transaction contracts.
+  /// Throws TikalUnsupportedException if the executor lacks the required capabilities.
   MigrationRunner(this.executor) {
     requirePostgresSchema(executor);
     if (executor is! TransactionExecutor) {
@@ -85,13 +111,11 @@ final class MigrationRunner {
       );
     }
   }
+
+  /// Executor used for all catalog reads and migration operations.
   final QueryExecutor executor;
   TransactionExecutor get _transactions => executor as TransactionExecutor;
 
-  @Deprecated(
-    'Use executor; migration execution only requires executor contracts.',
-  )
-  TikalDatabase get database => executor as TikalDatabase;
   static const _history = 'public._tikal_migrations';
 
   List<Migration> _ordered(Iterable<Migration> migrations) {

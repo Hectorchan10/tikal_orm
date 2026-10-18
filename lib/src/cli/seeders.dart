@@ -1,6 +1,23 @@
 part of 'cli.dart';
 
 Future<void> _makeSeeder(Directory root, String name) async {
+  final runner = File.fromUri(root.uri.resolve('bin/tikal_seed.dart'));
+  String? runnerSource;
+  if (!runner.existsSync()) {
+    final pubspec = File.fromUri(root.uri.resolve('pubspec.yaml'));
+    final package = pubspec.existsSync()
+        ? RegExp(
+            r'^name:\s*([a-z][a-z0-9_]*)\s*$',
+            multiLine: true,
+          ).firstMatch(pubspec.readAsStringSync())?.group(1)
+        : null;
+    if (package == null) {
+      throw StateError(
+        'Cannot read a valid package name from pubspec.yaml; seeder runner was not created.',
+      );
+    }
+    runnerSource = _seedRunner(package);
+  }
   final filename = name
       .replaceAllMapped(
         RegExp(r'([a-z0-9])([A-Z])'),
@@ -21,10 +38,9 @@ class $name {
   }
 }
 ''');
-  final runner = File.fromUri(root.uri.resolve('bin/tikal_seed.dart'));
-  if (!runner.existsSync()) {
+  if (runnerSource != null) {
     runner.parent.createSync(recursive: true);
-    runner.writeAsStringSync(_seedRunner);
+    runner.writeAsStringSync(runnerSource);
     stdout.writeln('Configure your connection in bin/tikal_seed.dart.');
   }
   stdout.writeln('Created ${output.path}. Run tikal generate.');
@@ -51,7 +67,7 @@ Future<void> _seedDatabase(Directory root, List<String> args) async {
 }
 
 // Application-owned bootstrap: generated only by make:seeder, never overwritten.
-const _seedRunner = '''import '../lib/generated/tikal.dart';
+String _seedRunner(String package) => '''import 'package:$package/tikal.dart';
 
 Future<void> main(List<String> args) async {
   if (args.length > 1 ||

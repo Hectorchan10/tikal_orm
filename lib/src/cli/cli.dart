@@ -4,16 +4,23 @@ import 'dart:convert';
 
 import 'package:crypto/crypto.dart';
 
-// Database
+// CLI
+import 'file_fingerprint.dart';
+
+// Generator
+import '../generator/model_analyzer.dart';
+
+// API
 import 'package:tikal_orm/tikal_orm.dart';
 
 // Generator
-import 'package:tikal_orm/src/generator/model_analyzer.dart';
-import 'package:tikal_orm/src/generator/seeder_analyzer.dart';
+import '../generator/analysis/seeder_analyzer.dart';
 
 part 'watch.dart';
+part 'editor.dart';
 part 'seeders.dart';
 part 'commands.dart';
+part 'schema_commands.dart';
 part 'generation.dart';
 part 'configuration.dart';
 

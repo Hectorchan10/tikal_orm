@@ -1,7 +1,7 @@
 part of 'cli.dart';
 
-/// Development-only generation loop. Polls content, not timestamps, so editor
-/// replacements and directory creation/removal work across Dart/Flutter hosts.
+/// Development loop with metadata caching, filesystem invalidation and periodic
+/// content reconciliation. Same-timestamp edits and atomic replacements are detected.
 /// [stop] permits embedding/tests; the CLI otherwise stops on Ctrl+C or SIGTERM.
 Future<void> watchGeneration(
   Directory root, {
@@ -27,6 +27,30 @@ Future<void> watchGeneration(
   }
   Future<void> pause() =>
       Future.any([Future<void>.delayed(interval), stopped.future]);
+  final cache = FileFingerprintCache();
+  StreamSubscription<FileSystemEvent>? changes;
+  try {
+    changes = root
+        .watch(recursive: true)
+        .listen(
+          (event) => cache.invalidate(event.path),
+          onError: (Object _) {
+            /* Periodic reconciliation preserves detection on watch failure. */
+          },
+        );
+  } on FileSystemException {
+    // Unsupported filesystem watches fall back to polling and full reconciliation.
+  } on UnsupportedError {
+    // Some platforms do not implement recursive filesystem watches.
+  }
+  var nextReconciliation = DateTime.now();
+  String fingerprint() {
+    final now = DateTime.now();
+    final force = !now.isBefore(nextReconciliation);
+    if (force) nextReconciliation = now.add(const Duration(seconds: 2));
+    return _generationFingerprint(root, cache, force: force);
+  }
+
   String? attempted;
   stdout.writeln(
     'Watching Dart models and configuration. Press Ctrl+C to stop.',
@@ -34,12 +58,12 @@ Future<void> watchGeneration(
   try {
     while (!stopped.isCompleted) {
       try {
-        final input = _generationFingerprint(root);
+        final input = fingerprint();
         if (input != attempted) {
           // Require one quiet interval to coalesce rapid editor saves.
           await pause();
           if (stopped.isCompleted) break;
-          if (_generationFingerprint(root) != input) continue;
+          if (fingerprint() != input) continue;
           attempted = input;
           try {
             await run(['generate'], directory: root);
@@ -52,6 +76,7 @@ Future<void> watchGeneration(
           } on ArgumentError catch (error) {
             stderr.writeln('Generation failed: ${error.message}');
           } on FileSystemException catch (error) {
+            attempted = null; // Retry transient read/write failures after a quiet interval.
             stderr.writeln('Generation failed: $error');
           }
         }
@@ -62,13 +87,18 @@ Future<void> watchGeneration(
       await pause();
     }
   } finally {
+    await changes?.cancel();
     for (final subscription in subscriptions) {
       await subscription.cancel();
     }
   }
 }
 
-String _generationFingerprint(Directory root) {
+String _generationFingerprint(
+  Directory root,
+  FileFingerprintCache cache, {
+  bool force = false,
+}) {
   File file(String path) => File.fromUri(root.uri.resolveUri(Uri.file(path)));
   final output = file('lib/generated/tikal.dart').absolute.path;
   final inputs = <String, String>{};
@@ -76,15 +106,13 @@ String _generationFingerprint(Directory root) {
     if (!source.existsSync() || inputs.containsKey(source.absolute.path)) {
       return;
     }
-    inputs[source.absolute.path] = sha256
-        .convert(source.readAsBytesSync())
-        .toString();
+    inputs[source.absolute.path] = cache.read(source, force: force);
   }
 
   void scan(String path) {
     final source = file(path);
     if (source.existsSync()) {
-      if (source.path != output && !source.path.endsWith('.tikal.dart')) {
+      if (source.path != output) {
         read(source);
       }
       return;
@@ -119,6 +147,7 @@ String _generationFingerprint(Directory root) {
   for (final path in paths) {
     scan(path);
   }
+  cache.retain(inputs.keys.toSet());
   final ordered = inputs.keys.toList()..sort();
   return sha256
       .convert(

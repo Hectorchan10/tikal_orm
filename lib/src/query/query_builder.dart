@@ -1,29 +1,30 @@
+// SQL
+import 'sql/quoting.dart';
+import 'sql/sql_writer.dart';
+import '../sql/sql_type.dart';
+
 // Query
-import 'dialect.dart';
-import 'quoting.dart';
-import 'order_by.dart';
-import 'sql_writer.dart';
-import 'sql_predicate.dart';
+import 'dialects/dialect.dart';
+import 'expressions/order_by.dart';
 
-// Config
-import '../config/sql_type.dart';
+// Database
+import '../database/query_result.dart';
 
-// Executor
-import '../executor/query_result.dart';
+// Query
+import 'expressions/sql_predicate.dart';
 
-// Model
-import '../model/table_definition.dart';
+// Database
+import '../database/query_executor.dart';
 
 // Errors
 import '../errors/tikal_exceptions.dart';
 
-// Executor
-import '../executor/query_executor.dart';
-
 // Model
-import '../model/column_definition.dart';
+import '../model/metadata/model_column.dart';
+import '../model/metadata/table_definition.dart';
+import '../model/metadata/column_definition.dart';
 
-/// How a query treats rows hidden by a soft delete.
+/// How queries treat rows hidden by soft deletion.
 enum TrashedScope {
   /// Exclude rows whose soft-delete column is set (the default).
   exclude,
@@ -43,19 +44,19 @@ enum TrashedScope {
 /// branches affecting it:
 ///
 /// ```dart
-/// final active = users.where(UserColumns.active.equals(true));
+/// final active = users.where(User_.active.equals(true));
 ///
-/// final byName = await active.orderBy(UserColumns.name).get();
-/// final newest = await active.orderBy(UserColumns.createdAt, descending: true).get();
+/// final byName = await active.orderBy(User_.name).get();
+/// final newest = await active.orderBy(User_.createdAt, descending: true).get();
 /// ```
 ///
 /// The usual entry point is `Repository.where` / `Repository.query`, which seed
 /// the builder from an existing repository:
 ///
 /// ```dart
-/// final users = await User.query(db)
-///     .where(UserColumns.active.equals(true))
-///     .orderBy(UserColumns.name)
+/// final users = await Tikal.model<User>().query()
+///     .where(User_.active.equals(true))
+///     .orderBy(User_.name)
 ///     .limit(20)
 ///     .get();
 /// ```
@@ -65,12 +66,16 @@ enum TrashedScope {
 /// `numeric` and `timestamptz` comparisons behave exactly as the repository's
 /// does. The builder emits the same SQL as `Repository.find`, so the two can be
 /// mixed freely.
+///
+/// Soft-delete scopes are applied to every matching query and bulk deletion.
+/// Bulk operations bypass model validation/hooks. Unsupported engine semantics
+/// throw TikalUnsupportedException instead of silently changing results.
 final class QueryBuilder<TModel extends Object> {
   /// Creates a builder that selects from [definition] through [executor].
   ///
   /// Prefer `Repository.query` / `Repository.where` when a repository already
   /// exists; this constructor is for code that only has a table definition.
-  QueryBuilder({required this.executor, required this.definition})
+  QueryBuilder({required this.executor, required this.definition, this.clock})
     : _predicate = null,
       _orderBy = <OrderBy<TModel>>[],
       _limit = null,
@@ -83,6 +88,7 @@ final class QueryBuilder<TModel extends Object> {
   const QueryBuilder._(
     this.executor,
     this.definition,
+    this.clock,
     this._predicate,
     this._orderBy,
     this._limit,
@@ -100,6 +106,9 @@ final class QueryBuilder<TModel extends Object> {
 
   /// Metadata for the table being queried.
   final TableDefinition<TModel> definition;
+
+  /// Time source for bulk timestamps, inherited from Repository.clock.
+  final DateTime Function()? clock;
 
   final SqlPredicate<TModel>? _predicate;
   final List<OrderBy<TModel>> _orderBy;
@@ -124,6 +133,7 @@ final class QueryBuilder<TModel extends Object> {
   }) => QueryBuilder<TModel>._(
     executor,
     definition,
+    clock,
     predicate ?? _predicate,
     orderBy ?? _orderBy,
     limit ?? _limit,
@@ -142,7 +152,7 @@ final class QueryBuilder<TModel extends Object> {
   /// Calling it more than once combines the predicates with `AND`:
   ///
   /// ```dart
-  /// users.where(UserColumns.active.equals(true)).where(UserColumns.age.isNotNull());
+  /// users.where(User_.active.equals(true)).where(User_.age.isNotNull());
   /// // WHERE "active" = $1 AND "age" IS NOT NULL
   /// ```
   QueryBuilder<TModel> where(SqlPredicate<TModel> predicate) => _copyWith(
@@ -152,7 +162,7 @@ final class QueryBuilder<TModel extends Object> {
   /// Adds `OR predicate` to the `WHERE` clause.
   ///
   /// ```dart
-  /// users.where(UserColumns.active.equals(true)).orWhere(UserColumns.role.equals('admin'));
+  /// users.where(User_.active.equals(true)).orWhere(User_.role.equals('admin'));
   /// // WHERE "active" = $1 OR "role" = $2
   /// ```
   QueryBuilder<TModel> orWhere(SqlPredicate<TModel> predicate) => _copyWith(
@@ -164,7 +174,7 @@ final class QueryBuilder<TModel extends Object> {
   /// Defaults to ascending. Call it repeatedly (or use [thenBy]) to sort by
   /// several columns; the terms are applied in the order given.
   QueryBuilder<TModel> orderBy(
-    ColumnDefinition column, {
+    ModelColumn<TModel, Object?> column, {
     bool descending = false,
     NullsOrder? nulls,
   }) => orderByTerm(
@@ -173,7 +183,7 @@ final class QueryBuilder<TModel extends Object> {
 
   /// Alias for [orderBy], reading better after a first sort term.
   QueryBuilder<TModel> thenBy(
-    ColumnDefinition column, {
+    ModelColumn<TModel, Object?> column, {
     bool descending = false,
     NullsOrder? nulls,
   }) => orderBy(column, descending: descending, nulls: nulls);
@@ -216,7 +226,7 @@ final class QueryBuilder<TModel extends Object> {
   SqlStatement toSql() => _selectWriter().build();
 
   SqlWriter _selectWriter() {
-    final dialect = dialectOf(executor);
+    final dialect = executor.dialect;
     final writer = _statementWriter(
       'SELECT ${_distinct ? 'DISTINCT ' : ''}${definition.quotedColumnsFor(dialect)} FROM',
     );
@@ -258,7 +268,7 @@ final class QueryBuilder<TModel extends Object> {
   /// The number of matching rows (`SELECT count(*) ...`).
   Future<int> count() async {
     final writer = _statementWriter(
-      'SELECT count(*) AS ${quotedIdentifier('total', dialectOf(executor))} FROM',
+      'SELECT count(*) AS ${quotedIdentifier('total', executor.dialect)} FROM',
     );
     _writeWhere(writer);
 
@@ -270,6 +280,9 @@ final class QueryBuilder<TModel extends Object> {
   /// Use a stable order (including a unique key). Count and records are separate
   /// statements; use a repeatable-read transaction when consistency is required.
   /// DISTINCT pagination is unsupported because count() counts matching rows.
+  /// Throws [ArgumentError] for nonpositive page/perPage and [StateError] for DISTINCT.
+  /// Ordering must include a unique key; concurrent writes can change counts unless
+  /// the caller uses a repeatable-read transaction on PostgreSQL/MySQL.
   Future<Page<TModel>> paginate({int page = 1, int perPage = 20}) async {
     if (page < 1) throw ArgumentError.value(page, 'page', 'Must be positive.');
     if (perPage < 1) {
@@ -283,7 +296,7 @@ final class QueryBuilder<TModel extends Object> {
 
   /// Whether at least one row matches.
   Future<bool> exists() async {
-    final dialect = dialectOf(executor);
+    final dialect = executor.dialect;
     final writer = _statementWriter('SELECT EXISTS(SELECT 1 FROM');
     _writeWhere(writer);
     writer.write(') AS ${quotedIdentifier('present', dialect)}');
@@ -295,19 +308,23 @@ final class QueryBuilder<TModel extends Object> {
   }
 
   /// The sum of [column] over the matching rows, or `null` when there are none.
-  Future<num?> sum(ColumnDefinition column) => _aggregate('sum', column);
+  Future<num?> sum(ModelColumn<TModel, Object?> column) =>
+      _aggregate('sum', column);
 
   /// The smallest value of [column], or `null` when there are no rows.
-  Future<num?> min(ColumnDefinition column) => _aggregate('min', column);
+  Future<num?> min(ModelColumn<TModel, Object?> column) =>
+      _aggregate('min', column);
 
   /// The largest value of [column], or `null` when there are no rows.
-  Future<num?> max(ColumnDefinition column) => _aggregate('max', column);
+  Future<num?> max(ModelColumn<TModel, Object?> column) =>
+      _aggregate('max', column);
 
   /// The average of [column], or `null` when there are no rows.
-  Future<num?> avg(ColumnDefinition column) => _aggregate('avg', column);
+  Future<num?> avg(ModelColumn<TModel, Object?> column) =>
+      _aggregate('avg', column);
 
   SqlWriter _statementWriter(String verb) {
-    final dialect = dialectOf(executor);
+    final dialect = executor.dialect;
     return SqlWriter(dialect: dialect)
       ..write(verb)
       ..write(' ')
@@ -315,6 +332,7 @@ final class QueryBuilder<TModel extends Object> {
   }
 
   /// Deletes every matching row and returns how many were removed.
+  /// Throws [TikalUnsupportedException] for soft deletion of versioned models.
   ///
   /// When the table supports soft deletes, matching rows are marked with the
   /// current time instead of being removed; use [forceDelete] to remove them
@@ -322,36 +340,39 @@ final class QueryBuilder<TModel extends Object> {
   /// operates on whatever the `WHERE` clause matches; with no predicate it
   /// affects the whole table (still excluding rows already soft-deleted, unless
   /// [withTrashed] was called). Use it for deliberate bulk operation.
+  /// Throws [TikalUnsupportedException] when ORDER BY, LIMIT, OFFSET or DISTINCT is set.
   Future<int> delete() {
+    _validateWriteClauses();
     final deleted = definition.deletedAtColumn;
     if (deleted == null) return forceDelete();
-    final writer = _statementWriter('UPDATE')
-      ..write(' SET ')
-      ..writeIdentifier(deleted.name)
-      ..write(' = ');
-    writer.bindTyped(deleted.sqlType, DateTime.now().toUtc());
-    _writeWhere(writer);
-    return _execute(writer);
+    final stamp = (clock ?? DateTime.now)().toUtc();
+    return _updateValues({deleted: stamp, ?definition.updatedAtColumn: stamp});
   }
 
   /// Permanently removes every matching row with a real `DELETE`.
   ///
   /// The soft-delete filter still applies, so call [withTrashed] or
   /// [onlyTrashed] to reach rows that `delete` would otherwise just mark.
+  /// Throws [TikalUnsupportedException] when ORDER BY, LIMIT, OFFSET or DISTINCT is set.
   Future<int> forceDelete() {
+    _validateWriteClauses();
     final writer = _statementWriter('DELETE FROM');
     _writeWhere(writer);
     return _execute(writer);
   }
 
   /// Clears the soft-delete column of every matching row.
+  /// Throws [TikalUnsupportedException] for versioned models.
   ///
   /// Unlike the other terminals this ignores the soft-delete scope and applies
   /// only the user predicate, so `where(...).restore()` restores the matching
   /// rows whether or not they are currently trashed. With no predicate it
   /// restores the whole table. Throws [TikalModelException] when the table does
   /// not support soft deletes.
+  /// Throws [TikalUnsupportedException] when ORDER BY, LIMIT, OFFSET or DISTINCT is set.
   Future<int> restore() {
+    _validateWriteClauses();
+    _rejectVersionedBulk();
     final deleted = definition.deletedAtColumn;
     if (deleted == null) {
       throw TikalModelException(
@@ -371,17 +392,36 @@ final class QueryBuilder<TModel extends Object> {
   }
 
   /// Updates every matching row, returning how many were affected.
+  /// Throws [TikalUnsupportedException] for versioned models.
   ///
-  /// [values] maps each column to its new value; values bind with the column's
-  /// SQL type. Like [delete], this bypasses model validation and applies
-  /// to whatever the `WHERE` clause matches, so build the predicate carefully.
+  /// [values] contains typed column assignments; values bind with the column's
+  /// SQL type. Missing updated-at values use the repository clock. Like [delete],
+  /// this bypasses model validation and applies to whatever the `WHERE` clause matches, so build the predicate carefully.
   ///
   /// ```dart
-  /// await QueryBuilder<User>(executor: db, definition: UserColumns.table)
-  ///     .where(UserColumns.active.equals(false))
-  ///     .update(<ColumnDefinition, Object?>{UserColumns.bio: 'archived'});
+  /// await QueryBuilder<User>(executor: db, definition: User_.table)
+  ///     .where(User_.active.equals(false))
+  ///     .update([User_.bio.assign('archived')]);
   /// ```
-  Future<int> update(Map<ColumnDefinition, Object?> values) {
+  /// Throws [TikalUnsupportedException] when ORDER BY, LIMIT, OFFSET or DISTINCT is set.
+  /// Throws [ArgumentError] before SQL if a SQL column name is assigned twice.
+  Future<int> update(Iterable<ColumnAssignment<TModel>> values) {
+    final names = <String>{};
+    final assignments = <ColumnDefinition, Object?>{};
+    for (final assignment in values) {
+      if (!names.add(assignment.column.name)) {
+        throw ArgumentError(
+          'Duplicate assignment for table "${definition.name}", column "${assignment.column.name}".',
+        );
+      }
+      assignments[assignment.column] = assignment.value;
+    }
+    return _updateValues(assignments);
+  }
+
+  Future<int> _updateValues(Map<ColumnDefinition, Object?> values) {
+    _validateWriteClauses();
+    _rejectVersionedBulk();
     if (values.isEmpty) {
       throw ArgumentError.value(
         values,
@@ -391,15 +431,41 @@ final class QueryBuilder<TModel extends Object> {
     }
     final writer = _statementWriter('UPDATE')..write(' SET ');
     var index = 0;
-    for (final entry in values.entries) {
+    final updatedAt = definition.updatedAtColumn;
+    final assignments = <ColumnDefinition, Object?>{
+      ...values,
+      if (updatedAt != null &&
+          !values.keys.any((column) => column.name == updatedAt.name))
+        updatedAt: (clock ?? DateTime.now)(),
+    };
+    for (final entry in assignments.entries) {
       if (index++ > 0) writer.write(', ');
       writer.writeIdentifier(entry.key.name);
       writer.write(' = ');
-      writer.bindTyped(entry.key.sqlType, entry.value);
+      writer.bindTyped(
+        entry.key.sqlType,
+        definition.encodeWriteValue(entry.key, entry.value),
+      );
     }
     _writeWhere(writer);
 
     return _execute(writer);
+  }
+
+  void _rejectVersionedBulk() {
+    if (definition.versionColumn != null) {
+      throw const TikalUnsupportedException(
+        'Versioned models require individual updates, soft deletes and restores.',
+      );
+    }
+  }
+
+  void _validateWriteClauses() {
+    if (_orderBy.isNotEmpty || _limit != null || _offset != null || _distinct) {
+      throw const TikalUnsupportedException(
+        'Bulk writes do not support ORDER BY, LIMIT, OFFSET or DISTINCT.',
+      );
+    }
   }
 
   Future<int> _execute(SqlWriter writer) => executor.execute(
@@ -417,7 +483,7 @@ final class QueryBuilder<TModel extends Object> {
   );
 
   Future<num?> _aggregate(String function, ColumnDefinition column) async {
-    final dialect = dialectOf(executor);
+    final dialect = executor.dialect;
     final writer = _statementWriter(
       'SELECT $function(${quotedIdentifier(column.name, dialect)}) AS ${quotedIdentifier('value', dialect)} FROM',
     );
@@ -460,17 +526,34 @@ final class QueryBuilder<TModel extends Object> {
 
 /// Immutable records and metadata returned by QueryBuilder.paginate.
 final class Page<T> {
+  /// Creates immutable page records and their count/offset metadata.
+  /// Supply positive page/perPage values; use paginate for validated metadata.
   Page({
     required List<T> records,
     required this.total,
     required this.page,
     required this.perPage,
   }) : records = List.unmodifiable(records);
+
+  /// Immutable records returned for this page.
   final List<T> records;
+
+  /// Total number of matching rows, ignoring the page limit and offset.
   final int total;
+
+  /// One-based page number.
   final int page;
+
+  /// Maximum number of records requested per page.
   final int perPage;
+
+  /// Number of pages needed to contain the reported total.
+  /// Throws [UnsupportedError] if this page was constructed with zero perPage.
   int get totalPages => (total + perPage - 1) ~/ perPage;
+
+  /// Whether the reported total includes a page after this one.
   bool get hasNextPage => page < totalPages;
+
+  /// Whether this page number is greater than one.
   bool get hasPreviousPage => page > 1;
 }

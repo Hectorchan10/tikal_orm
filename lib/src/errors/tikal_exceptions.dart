@@ -3,6 +3,7 @@
 /// Catch [TikalException] to handle any library-specific failure, or catch a
 /// concrete subtype to react to a specific problem.
 abstract class TikalException implements Exception {
+  /// Creates an ORM error with a human-readable message.
   const TikalException(this.message);
 
   /// Human readable description of what went wrong.
@@ -12,26 +13,24 @@ abstract class TikalException implements Exception {
   String toString() => '$runtimeType: $message';
 }
 
-/// Thrown when a [PostgresConfig] is incomplete or invalid.
+/// Thrown when database settings or model registry configuration are invalid.
 final class TikalConfigurationException extends TikalException {
+  /// Reports invalid database settings or a model registry configuration.
   const TikalConfigurationException(super.message);
 }
 
 /// Thrown when TikalORM cannot open a connection or the connection is lost.
 final class TikalConnectionException extends TikalException {
+  /// Reports a connection failure, optionally preserving the original cause.
   const TikalConnectionException(super.message, {this.cause});
 
   /// The underlying error, when there is one.
   final Object? cause;
-
-  @override
-  String toString() => cause == null
-      ? super.toString()
-      : '${super.toString()} (caused by $cause)';
 }
 
 /// Thrown when a database handle is used after it has been closed.
 final class TikalDatabaseClosedException extends TikalException {
+  /// Reports an operation attempted on a closed database or expired session.
   const TikalDatabaseClosedException(super.message);
 }
 
@@ -42,6 +41,7 @@ final class TikalDatabaseClosedException extends TikalException {
 /// case-sensitive `LIKE`, so a case-sensitive text match is rejected rather than
 /// silently returning different rows on a different engine.
 final class TikalUnsupportedException extends TikalException {
+  /// Reports an operation the selected engine cannot represent safely.
   const TikalUnsupportedException(super.message);
 }
 
@@ -51,7 +51,10 @@ final class TikalUnsupportedException extends TikalException {
 /// [hint], [constraint], ...) are preserved so callers can react to individual
 /// error codes, for example `23505` (unique violation). Other engines fill the
 /// fields they can provide.
-final class TikalQueryException extends TikalException {
+/// Remains directly constructible; base permits the typed constraint subtypes
+/// while retaining the shared diagnostic contract.
+base class TikalQueryException extends TikalException {
+  /// Preserves server diagnostics and the bound statement that failed.
   TikalQueryException({
     required this.sql,
     this.parameters,
@@ -69,10 +72,11 @@ final class TikalQueryException extends TikalException {
   /// The statement that failed.
   final String sql;
 
-  /// The parameters that were bound to [sql], as passed by the caller.
+  /// Sensitive bound values, as passed by the caller. Never serialize this field
+  /// or the entire exception into logs. Use [redactedDiagnostics] instead.
   final Object? parameters;
 
-  /// The message emitted by the server.
+  /// Sensitive server message; inspect explicitly, never log automatically.
   final String? serverMessage;
 
   /// The 5-character PostgreSQL error code (`SQLSTATE`), when available.
@@ -81,10 +85,10 @@ final class TikalQueryException extends TikalException {
   /// Numeric server diagnostic (e.g. MySQL 1062 for a duplicate key).
   final int? errorCode;
 
-  /// Extra detail reported by the server.
+  /// Sensitive server detail, which can contain bound values.
   final String? detail;
 
-  /// Server provided hint for fixing the problem.
+  /// Sensitive server hint, for explicit inspection only.
   final String? hint;
 
   /// Table involved in the failure, when reported.
@@ -99,36 +103,86 @@ final class TikalQueryException extends TikalException {
   /// The underlying driver error.
   final Object? cause;
 
+  /// Allowlisted diagnostics suitable for automatic logs: category and codes only.
+  /// Full sql/parameters/serverMessage/detail/hint/cause and identifiers may contain
+  /// sensitive data and require deliberate inspection outside automatic logging.
+  Map<String, Object?> redactedDiagnostics() => Map.unmodifiable({
+    'category': runtimeType.toString(),
+    'sqlState': sqlState != null && RegExp(r'^[A-Z0-9]{5}$').hasMatch(sqlState!)
+        ? sqlState
+        : null,
+    'errorCode': errorCode,
+  });
+
   static String _summary({String? sqlState, String? serverMessage}) {
     final text = serverMessage ?? 'The statement was rejected by the database.';
     return sqlState == null ? text : '$sqlState: $text';
   }
 
   @override
-  String toString() {
-    final buffer = StringBuffer('TikalQueryException: $message')
-      ..write('\n  sql: $sql');
-    if (detail != null) {
-      buffer.write('\n  detail: $detail');
-    }
-    if (hint != null) {
-      buffer.write('\n  hint: $hint');
-    }
-    if (table != null) {
-      buffer.write('\n  table: $table');
-    }
-    if (column != null) {
-      buffer.write('\n  column: $column');
-    }
-    if (constraint != null) {
-      buffer.write('\n  constraint: $constraint');
-    }
-    return buffer.toString();
-  }
+  String toString() =>
+      '$runtimeType: Query rejected'
+      '${sqlState != null && RegExp(r"^[A-Z0-9]{5}$").hasMatch(sqlState!) ? ' [SQLSTATE $sqlState]' : ''}'
+      '${errorCode == null ? '' : ' [errorCode $errorCode]'}';
+}
+
+/// A UNIQUE or primary-key constraint rejected the statement.
+final class TikalUniqueViolation extends TikalQueryException {
+  /// Preserves the original statement and all available engine diagnostics.
+  TikalUniqueViolation({
+    required super.sql,
+    super.parameters,
+    super.serverMessage,
+    super.sqlState,
+    super.errorCode,
+    super.detail,
+    super.hint,
+    super.table,
+    super.column,
+    super.constraint,
+    super.cause,
+  });
+}
+
+/// A foreign-key constraint rejected the statement.
+final class TikalForeignKeyViolation extends TikalQueryException {
+  /// Preserves the original statement and all available engine diagnostics.
+  TikalForeignKeyViolation({
+    required super.sql,
+    super.parameters,
+    super.serverMessage,
+    super.sqlState,
+    super.errorCode,
+    super.detail,
+    super.hint,
+    super.table,
+    super.column,
+    super.constraint,
+    super.cause,
+  });
+}
+
+/// A NOT NULL constraint or required value rejected the statement.
+final class TikalNotNullViolation extends TikalQueryException {
+  /// Preserves the original statement and all available engine diagnostics.
+  TikalNotNullViolation({
+    required super.sql,
+    super.parameters,
+    super.serverMessage,
+    super.sqlState,
+    super.errorCode,
+    super.detail,
+    super.hint,
+    super.table,
+    super.column,
+    super.constraint,
+    super.cause,
+  });
 }
 
 /// Thrown when a Dart value cannot be bound as a SQL parameter.
 final class TikalParameterException extends TikalException {
+  /// Reports an invalid bound value, optionally identifying its position and cause.
   const TikalParameterException(
     super.message, {
     this.position,
@@ -155,7 +209,7 @@ final class TikalParameterException extends TikalException {
       buffer.write('\n  valueType: ${value.runtimeType}');
     }
     if (cause != null) {
-      buffer.write('\n  caused by: $cause');
+      buffer.write('\n  causeType: ${cause.runtimeType}');
     }
     return buffer.toString();
   }
@@ -163,6 +217,7 @@ final class TikalParameterException extends TikalException {
 
 /// Thrown when a column cannot be read from a [TikalRow].
 final class TikalColumnException extends TikalException {
+  /// Reports a missing column, an out-of-range index or an incompatible decoded type.
   const TikalColumnException(super.message, {this.column, this.available});
 
   /// Name of the column that could not be read.
@@ -186,15 +241,17 @@ final class TikalColumnException extends TikalException {
 /// Examples: a table without a primary key where one is required, a composite
 /// key used with a single-key API, a model with a missing mandatory field.
 final class TikalModelException extends TikalException {
+  /// Reports invalid model metadata or an unsupported mapping operation.
   const TikalModelException(super.message);
 }
 
 /// Thrown before a write when the model fails validation.
 ///
-/// Validation combines the model's own rules (`TikalModel.validate`) with the
+/// Validation combines the model's own rules (`ModelLifecycle.validate`) with the
 /// structural rules of its table definition (for example a `NOT NULL` column
 /// without a default left unset).
 final class TikalValidationException extends TikalException {
+  /// Collects all model validation failures before executing a statement.
   TikalValidationException(List<String> errors)
     : errors = List<String>.unmodifiable(errors),
       super('Validation failed: ${errors.join('; ')}');
@@ -216,6 +273,7 @@ final class TikalValidationException extends TikalException {
 
 /// Thrown when an operation expected a row that does not exist.
 final class TikalEntityNotFoundException extends TikalException {
+  /// Reports the table and optional primary key for a missing entity.
   TikalEntityNotFoundException({required this.table, this.primaryKey})
     : super(_message(table, primaryKey));
 
@@ -231,4 +289,23 @@ final class TikalEntityNotFoundException extends TikalException {
     }
     return 'No row in "$table" matches key(${primaryKey.keys.join(', ')}).';
   }
+}
+
+/// An optimistic write matched neither the key nor its expected version.
+/// The row may have been deleted or modified; no extra existence query is made.
+final class TikalConcurrencyException extends TikalException {
+  /// Reports a missing or concurrently changed row without exposing key values.
+  TikalConcurrencyException({
+    required this.table,
+    required this.expectedVersion,
+  }) : super(
+         'No row in "$table" matches the expected version $expectedVersion. '
+         'It may have been deleted or concurrently modified.',
+       );
+
+  /// Table targeted by the optimistic write.
+  final String table;
+
+  /// Persisted counter supplied to the write predicate.
+  final int expectedVersion;
 }

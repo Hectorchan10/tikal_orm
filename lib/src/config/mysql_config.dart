@@ -9,6 +9,8 @@ import '../errors/tikal_exceptions.dart';
 
 /// Immutable connection settings for a MySQL/MariaDB database.
 final class MysqlConfig extends ServerConfig {
+  /// Creates immutable MySQL/MariaDB settings and validates host, pool and collation.
+  /// Sessions always use UTC; invalid settings throw TikalConfigurationException.
   MysqlConfig({
     super.host = 'localhost',
     super.port = 3306,
@@ -17,16 +19,10 @@ final class MysqlConfig extends ServerConfig {
     super.password,
     this.secure = false,
     super.maxConnections = 5,
-    String timeZone = '+00:00',
     this.collation = 'utf8mb4_general_ci',
     super.connectTimeout = const Duration(seconds: 15),
     super.queryTimeout,
   }) {
-    if (timeZone != '+00:00') {
-      throw const TikalConfigurationException(
-        'MySQL sessions require UTC (+00:00).',
-      );
-    }
     if (!RegExp(r'^utf8mb4_[a-zA-Z0-9_]+$').hasMatch(collation)) {
       throw const TikalConfigurationException(
         'collation must be a utf8mb4 collation name.',
@@ -54,6 +50,10 @@ final class MysqlConfig extends ServerConfig {
     }
     final credentials = uri.userInfo.split(':');
     final parameters = uri.queryParameters;
+    _requireUtc([
+      parameters['time_zone'],
+      parameters['timezone'],
+    ], fromUri: true);
     return MysqlConfig(
       host: uri.host.isEmpty ? 'localhost' : uri.host,
       port: uri.hasPort ? uri.port : 3306,
@@ -66,7 +66,6 @@ final class MysqlConfig extends ServerConfig {
           : Uri.decodeComponent(credentials.sublist(1).join(':')),
       secure: parseBoolConfig(parameters['secure'], defaultValue: false),
       maxConnections: integerOption(parameters, 'max_connections', 5),
-      timeZone: parameters['time_zone'] ?? parameters['timezone'] ?? '+00:00',
       collation: parameters['collation'] ?? 'utf8mb4_general_ci',
       connectTimeout: Duration(
         seconds: integerOption(parameters, 'connect_timeout', 15),
@@ -77,6 +76,7 @@ final class MysqlConfig extends ServerConfig {
   /// Reads the configuration from environment variables.
   factory MysqlConfig.fromEnvironment([Map<String, String>? environment]) {
     final env = environment ?? Platform.environment;
+    _requireUtc([env['MYSQL_TIME_ZONE'], env['MYSQL_TIMEZONE']]);
     for (final rawUrl in [env['DATABASE_URL'], env['MYSQL_URL']]) {
       if (rawUrl == null || rawUrl.isEmpty) continue;
       final uri = Uri.tryParse(rawUrl);
@@ -108,17 +108,19 @@ final class MysqlConfig extends ServerConfig {
       username: username!,
       password: firstNonEmpty([env['MYSQL_PASSWORD']]),
       secure: parseBoolConfig(env['MYSQL_SECURE'], defaultValue: false),
-      timeZone: env['MYSQL_TIME_ZONE'] ?? env['MYSQL_TIMEZONE'] ?? '+00:00',
       collation: env['MYSQL_COLLATION'] ?? 'utf8mb4_general_ci',
     );
   }
 
+  /// Whether MySQL transport encryption is enabled.
   final bool secure;
-  @Deprecated('MySQL sessions always use UTC; omit timeZone.')
-  String get timeZone => '+00:00';
+
+  /// Validated utf8mb4 collation used when opening MySQL sessions.
   final String collation;
   static const _unset = Object();
 
+  /// Returns validated settings with the supplied replacements.
+  /// Omitted optional values are preserved; passing null clears nullable settings.
   MysqlConfig copyWith({
     String? host,
     int? port,
@@ -127,7 +129,6 @@ final class MysqlConfig extends ServerConfig {
     Object? password = _unset,
     bool? secure,
     int? maxConnections,
-    String? timeZone,
     String? collation,
     Duration? connectTimeout,
     Object? queryTimeout = _unset,
@@ -139,7 +140,6 @@ final class MysqlConfig extends ServerConfig {
     password: password == _unset ? this.password : password as String?,
     secure: secure ?? this.secure,
     maxConnections: maxConnections ?? this.maxConnections,
-    timeZone: timeZone ?? '+00:00',
     collation: collation ?? this.collation,
     connectTimeout: connectTimeout ?? this.connectTimeout,
     queryTimeout: queryTimeout == _unset
@@ -164,4 +164,16 @@ final class MysqlConfig extends ServerConfig {
 
   @override
   String toString() => 'MysqlConfig(${describe()})';
+}
+
+void _requireUtc(Iterable<String?> values, {bool fromUri = false}) {
+  for (final value in values.whereType<String>()) {
+    // URL query parsing treats an unescaped '+' as a space.
+    final normalized = fromUri ? value.replaceFirst(RegExp(r'^ '), '+') : value;
+    if (normalized != '+00:00') {
+      throw const TikalConfigurationException(
+        'MySQL sessions require UTC (+00:00).',
+      );
+    }
+  }
 }
